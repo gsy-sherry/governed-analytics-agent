@@ -4,7 +4,7 @@ A CLI prototype for internal self-service analytics using synthetic SQLite data 
 
 The planned design uses LangGraph for orchestration and the OpenAI API for intent understanding. A lightweight metric registry and knowledge retrieval inform structured query plans. Deterministic role-based access control governs execution through approved parameterised SQL templates, and structured audit logs record decisions and execution outcomes.
 
-This initial phase provides the Python package, test directory, and local setup files.
+The prototype includes a synthetic dataset generator, governed metric registry, and a CLI for aggregate analytics.
 
 ## Local setup
 
@@ -17,7 +17,7 @@ python3 -m venv .venv
 .venv/bin/python -c "import langgraph.graph, openai, pytest, sqlite3"
 ```
 
-If `python3` points to an older interpreter, substitute the path to a supported Python executable. Dependency checks require no API key. `.env.example` documents the environment variable for the future OpenAI integration.
+If `python3` points to an older interpreter, substitute the path to a supported Python executable. Dependency checks require no API key. `.env.example` lists the environment variables for the CLI.
 
 ## Project layout
 
@@ -75,3 +75,20 @@ All eight metrics allow grouping by `customer_segment` and `country`. Checkout m
 The access policy checks the exact metric ID and requested dimensions against the registry for an authenticated role supplied by the caller. Role names are case-insensitive. Unknown roles and metrics are denied. Admin access is limited to approved aggregates and dimensions, with no raw record or arbitrary SQL capability.
 
 Retrieval normalizes case and punctuation and matches whole phrases from metric IDs, names, definitions and synonyms. Longer matches rank first, with ties ordered by metric ID. The caller can set `top_k` and receives only definitions visible to its role. An unmatched question returns no candidates. A matching phrase in a broader question can surface a definition for consideration. Every candidate still requires explicit intent validation and authorization before any future execution.
+
+## Analytics CLI
+
+Set `OPENAI_API_KEY` and `OPENAI_MODEL` in the process environment. Choose an available OpenAI model that supports Structured Outputs through the Responses API. Generate the fixture and run a question from the repository root.
+
+```sh
+.venv/bin/python -m governed_analytics.synthetic_data
+.venv/bin/python -m governed_analytics --role Marketing "What was AOV by customer segment in June 2025?"
+```
+
+The `--role` flag simulates a trusted role for local demonstration. Production use requires authentication and server-side role assignment. Use `--db` to select a trusted synthetic SQLite fixture. The JSON response includes a status and a human-readable answer. Successful responses also include the metric definition, reporting dates and unit. Decimal values are serialized as strings to preserve precision. The end date is exclusive. A grouped query with no matching rows returns no groups, and an ungrouped ratio or average with a zero denominator returns null.
+
+LangGraph retrieves role-visible definitions, calls OpenAI for a strict query plan, validates the plan, builds approved parameterised SQL, executes it in read-only and query-only mode, and formats the aggregate result locally. Invalid plans and policy failures bypass SQL execution. Queries support one approved metric and at most one approved grouping. A grouped query is capped at 100 groups and fails safely if it exceeds that limit.
+
+The model receives the question, matching role-visible metric metadata, and the fixed reporting date of 30 June 2025. Database rows and query results stay local. Use synthetic questions without confidential information. Relative dates use the reporting date. For example, “last month” refers to May 2025. Lexical retrieval requires a recognizable metric phrase, and intent interpretation can still misunderstand a question. Deterministic checks constrain execution to approved aggregates but do not guarantee semantic accuracy. This local prototype relies on a trusted SQLite fixture and does not implement small-group suppression.
+
+Run `.venv/bin/python -m pytest` for the offline suite. Agent tests inject model responses and require no API key.

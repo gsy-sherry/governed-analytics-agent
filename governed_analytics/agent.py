@@ -1,20 +1,35 @@
 """Governed analytics workflow for one aggregate question."""
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import NotRequired, TypedDict
+from time import perf_counter
+from typing import Literal, NotRequired, TypedDict
+from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
+from langsmith import tracing_context
+from openai import APIConnectionError, APIError, APIResponseValidationError
 from pydantic import ValidationError
 
-from governed_analytics.access_policy import can_access_metric
+from governed_analytics.access_policy import POLICY_VERSION, ROLES, can_access_metric
 from governed_analytics.approved_queries import AggregateRow, _ApprovedQuery, _build_sql, _execute_query
-from governed_analytics.intent import REPORTING_END, IntentInterpreter, QueryPlan
-from governed_analytics.knowledge_retrieval import retrieve_metrics
+from governed_analytics.audit import DEFAULT_AUDIT_PATH, AuditEvent, append_event
+from governed_analytics.intent import (
+    REPORTING_END,
+    IncompleteIntentError,
+    IntentConfigurationError,
+    IntentInterpreter,
+    IntentOutput,
+    IntentServiceError,
+    QueryPlan,
+)
+from governed_analytics.knowledge_retrieval import match_metrics
 from governed_analytics.metric_registry import METRIC_REGISTRY, MetricDefinition
+from governed_analytics.question_scope import supports_question
 from governed_analytics.synthetic_data import HISTORY_START
 
 
@@ -36,11 +51,17 @@ class AnalyticsResponse:
     dimension: str | None = None
     unit: str | None = None
     results: tuple[Result, ...] = ()
+    request_id: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _TrustedContext:
     role: str
+    metric_id: str | None = None
+    plan: QueryPlan | None = None
+    authorization: Literal["allowed", "denied", "not_evaluated"] = "not_evaluated"
+    sql_attempted: bool = False
+    sql_succeeded: bool = False
 
 
 class _State(TypedDict):
@@ -58,32 +79,64 @@ def _stop(status: str, diagnostic: str, message: str) -> dict[str, AnalyticsResp
 
 
 def _retrieve(state: _State, runtime: Runtime[_TrustedContext]) -> dict:
-    return {"candidates": retrieve_metrics(state["question"], runtime.context.role, top_k=len(METRIC_REGISTRY))}
+    context = runtime.context
+    question = state["question"]
+    if len(question) > 4096:
+        return _stop("unsupported", "question_too_long", "Please shorten the analytics question.")
+    matches = match_metrics(question)
+    for metric in matches:
+        if not can_access_metric(context.role, metric.metric_id):
+            context.metric_id = metric.metric_id
+            context.authorization = "denied"
+            return _stop("denied", "metric_access_denied", "This role cannot access the requested metric.")
+    if context.role == "Unknown":
+        context.authorization = "denied"
+        return _stop("denied", "unknown_role", "The trusted role is unavailable.")
+    if len(matches) > 1:
+        return _stop("unsupported", "multiple_metrics", "Request one approved metric at a time.")
+    if matches:
+        context.metric_id = matches[0].metric_id
+    return {"candidates": matches}
 
 
 def _validate(state: _State, runtime: Runtime[_TrustedContext]) -> dict:
+    raw_plan = state["raw_plan"]
+    if not isinstance(raw_plan, str) or len(raw_plan) > 8192:
+        return _stop("rejected", "invalid_plan", "The request did not produce a valid query plan.")
     try:
-        plan = QueryPlan.model_validate_json(state["raw_plan"])
+        intent = IntentOutput.model_validate_json(raw_plan)
+        if intent.intent_status == "answerable":
+            if intent.metric_id is not None and intent.metric_id not in METRIC_REGISTRY:
+                return _stop("unsupported", "unapproved_metric", "This metric is outside the approved analytics scope.")
+            plan = QueryPlan.model_validate_json(raw_plan)
     except ValidationError:
         return _stop("rejected", "invalid_plan", "The request did not produce a valid query plan.")
-    if plan.intent_status == "unsupported":
+    if intent.intent_status == "unsupported":
         return _stop("unsupported", "unsupported_intent", "This request is outside the approved analytics scope.")
-    if plan.intent_status == "clarification_required":
+    if intent.intent_status == "clarification_required":
         return _stop("clarification_required", "ambiguous_intent", "Please specify one metric and a reporting period.")
 
+    context = runtime.context
     metric = METRIC_REGISTRY.get(plan.metric_id)
     if metric is None:
         return _stop("rejected", "invalid_plan", "The request did not produce a valid query plan.")
-    if not can_access_metric(runtime.context.role, metric.metric_id):
+    if not can_access_metric(context.role, metric.metric_id):
+        context.metric_id = metric.metric_id
+        context.authorization = "denied"
         return _stop("denied", "metric_access_denied", "This role cannot access the requested metric.")
     if plan.dimension is not None and not can_access_metric(
-        runtime.context.role, metric.metric_id, dimensions=(plan.dimension,),
+        context.role, metric.metric_id, dimensions=(plan.dimension,),
     ):
+        context.authorization = "denied"
         return _stop("rejected", "invalid_dimension", "That grouping is unavailable for the requested metric.")
     if not HISTORY_START <= plan.start_date < plan.end_date <= REPORTING_END:
         return _stop("rejected", "invalid_period", "Choose a non-empty period within January through June 2025.")
     if metric not in state["candidates"]:
         return _stop("unsupported", "unmatched_metric", "The requested metric could not be matched to an approved definition.")
+    if not supports_question(state["question"], metric, plan.dimension):
+        return _stop("unsupported", "unsupported_question_shape", "Specify one approved metric, a period and optionally one grouping.")
+    context.plan = plan
+    context.authorization = "allowed"
     return {"plan": plan}
 
 
@@ -145,19 +198,34 @@ def _route(state: _State) -> str:
 
 
 class AnalyticsAgent:
-    def __init__(self, db_path: Path, interpreter: IntentInterpreter):
+    def __init__(self, db_path: Path, interpreter: IntentInterpreter, *, audit_path: Path | None = None):
+        self._audit_path = DEFAULT_AUDIT_PATH if audit_path is None else audit_path
+
         def interpret(state: _State) -> dict:
             try:
                 return {"raw_plan": interpreter(state["question"], state["candidates"])}
+            except (ValidationError, APIResponseValidationError):
+                return _stop("rejected", "invalid_plan", "The request did not produce a valid query plan.")
+            except IncompleteIntentError:
+                return _stop("error", "intent_incomplete", "The intent service returned no complete structured response.")
+            except IntentConfigurationError:
+                return _stop("error", "openai_configuration", "Set OPENAI_API_KEY and OPENAI_MODEL in the local environment.")
+            except APIConnectionError:
+                return _stop("error", "intent_connection_failed", "The intent service could not be reached.")
+            except (APIError, IntentServiceError):
+                return _stop("error", "intent_api_failed", "The intent service could not complete the request.")
             except Exception:
                 # SDK and adapter errors can contain request data.
                 return _stop("error", "intent_failed", "The intent service could not interpret the question.")
 
-        def execute(state: _State) -> dict:
+        def execute(state: _State, runtime: Runtime[_TrustedContext]) -> dict:
+            runtime.context.sql_attempted = True
             try:
-                return {"rows": _execute_query(db_path, state["query"])}
+                rows = _execute_query(db_path, state["query"])
             except (sqlite3.Error, OSError, ValueError):
                 return _stop("error", "database_failed", "The approved aggregate query could not be completed.")
+            runtime.context.sql_succeeded = True
+            return {"rows": rows}
 
         graph = StateGraph(_State, context_schema=_TrustedContext)
         graph.add_node("retrieve_context", _retrieve)
@@ -167,7 +235,7 @@ class AnalyticsAgent:
         graph.add_node("execute_query", execute)
         graph.add_node("format_answer", _format)
         graph.add_edge(START, "retrieve_context")
-        graph.add_edge("retrieve_context", "interpret_intent")
+        graph.add_conditional_edges("retrieve_context", _route, {"stop": "format_answer", "continue": "interpret_intent"})
         graph.add_conditional_edges("interpret_intent", _route, {"stop": "format_answer", "continue": "validate_plan"})
         graph.add_conditional_edges("validate_plan", _route, {"stop": "format_answer", "continue": "build_sql"})
         graph.add_conditional_edges("build_sql", _route, {"stop": "format_answer", "continue": "execute_query"})
@@ -176,4 +244,34 @@ class AnalyticsAgent:
         self._graph = graph.compile()
 
     def ask(self, question: str, *, trusted_role: str) -> AnalyticsResponse:
-        return self._graph.invoke({"question": question}, context=_TrustedContext(trusted_role))["response"]
+        started = perf_counter()
+        request_id = str(uuid4())
+        role = trusted_role.strip().casefold() if isinstance(trusted_role, str) else ""
+        context = _TrustedContext(ROLES.get(role, "Unknown"))
+        try:
+            with tracing_context(enabled=False):
+                response = self._graph.invoke({"question": question}, context=context)["response"]
+        except Exception:
+            response = AnalyticsResponse("error", "The analytics request could not be completed.", "workflow_failed")
+        plan = context.plan
+        try:
+            append_event(self._audit_path, AuditEvent(
+                request_id=request_id,
+                timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                trusted_role=context.role,
+                metric_id=context.metric_id,
+                dimension=plan.dimension if plan else None,
+                start_date=plan.start_date.isoformat() if plan else None,
+                end_date=plan.end_date.isoformat() if plan else None,
+                authorization_decision=context.authorization,
+                response_status=response.status,
+                diagnostic=response.diagnostic,
+                sql_attempted=context.sql_attempted,
+                sql_succeeded=context.sql_succeeded,
+                latency_ms=round((perf_counter() - started) * 1000, 3),
+                returned_row_count=len(response.results),
+                policy_version=POLICY_VERSION,
+            ))
+        except OSError:
+            return AnalyticsResponse("error", "The audit event could not be written.", "audit_write_failed", request_id=request_id)
+        return replace(response, request_id=request_id)

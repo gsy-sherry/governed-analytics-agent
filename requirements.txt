@@ -1,4 +1,5 @@
 langgraph
+langsmith
 openai
 pytest
 pydantic>=2,<3

@@ -46,3 +46,6 @@ __pycache__/
 .coverage
 .coverage.*
 htmlcov/
+
+# Structured audit output
+*.jsonl

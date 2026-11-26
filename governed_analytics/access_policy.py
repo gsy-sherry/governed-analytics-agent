@@ -2,6 +2,9 @@
 
 from governed_analytics.metric_registry import METRIC_REGISTRY
 
+POLICY_VERSION = "2"
+ROLES = {role.casefold(): role for metric in METRIC_REGISTRY.values() for role in metric.allowed_roles}
+
 
 def can_access_metric(role: str, metric_id: str, *, dimensions: tuple[str, ...] = ()) -> bool:
     """Check a trusted role against an exact metric ID and approved dimensions."""

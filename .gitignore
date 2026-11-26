@@ -49,3 +49,6 @@ htmlcov/
 
 # Structured audit output
 *.jsonl
+
+# Generated evaluation runs
+/reports/

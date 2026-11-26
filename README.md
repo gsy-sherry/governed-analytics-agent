@@ -1,10 +1,10 @@
 # Governed Analytics Agent
 
-A CLI prototype for internal self-service analytics using synthetic SQLite data for customers, checkout sessions, orders, and payments.
+A local prototype for internal payments analytics in a regulated enterprise. It lets Product, Marketing and Payments users ask business questions in natural language while keeping metric definitions, access decisions and query execution under application control. The SQLite fixture contains synthetic customers, checkout sessions, orders and payments.
 
-The planned design uses LangGraph for orchestration and the OpenAI API for intent understanding. A lightweight metric registry and knowledge retrieval inform structured query plans. Deterministic role-based access control governs execution through approved parameterised SQL templates, and structured audit logs record decisions and execution outcomes.
+The CLI and Streamlit UI share the same LangGraph workflow. The metric registry and lexical retrieval define the approved measures and synonyms. Deterministic preflight checks the caller-supplied role and extracts the requested metric, date range and optional grouping. Only requests that pass preflight reach OpenAI for structured intent recognition. The workflow validates the returned plan against preflight and policy before it builds a parameterised aggregate from approved SQL templates. SQLite is opened read-only, answers are formatted locally, and a terminal audit event records the decision and execution outcome.
 
-The prototype includes a synthetic dataset generator, governed metric registry, and a CLI for aggregate analytics.
+This design keeps authorisation and SQL construction outside the model, gives each metric a reviewable definition, and supports offline verification with an injected interpreter. Both interfaces simulate trusted roles for demonstration. The repository does not implement production authentication.
 
 ## Local setup
 
@@ -14,16 +14,20 @@ Use Python 3.11 or newer. Check the interpreter version before creating the virt
 python3 --version
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -c "import langgraph.graph, openai, pytest, sqlite3"
+.venv/bin/python -c "import langgraph.graph, langsmith, openai, pydantic, pytest, sqlite3, streamlit"
 ```
 
-If `python3` points to an older interpreter, substitute the path to a supported Python executable. Dependency checks require no API key. `.env.example` lists the environment variables for the CLI.
+If `python3` points to an older interpreter, substitute the path to a supported Python executable. Dependency checks require no API key. `.env.example` lists the process environment variables for both interfaces. The application does not load a `.env` file automatically.
+
+The final review used Python 3.14.6 on macOS with LangGraph 1.2.24, LangSmith 0.16.2, OpenAI 3.59.0, Pydantic 2.14.4, Streamlit 1.67.0 and pytest 9.2.0. `requirements.txt` declares dependencies and lets pip resolve compatible versions. For an exact environment rebuild, use the tested versions and capture the transitive dependency resolution separately.
 
 ## Project layout
 
 | Path | Purpose |
 | --- | --- |
 | `governed_analytics/` | Application package |
+| `app.py` | Local Streamlit demonstration |
+| `evaluation/` | Evaluation runner, synthetic cases and curated evidence |
 | `tests/` | Pytest test package |
 | `requirements.txt` | Runtime and test dependencies |
 | `.env.example` | Environment variable template |
@@ -72,9 +76,9 @@ Active customers, GMV and average order value use `order_status = 'completed'`, 
 
 All eight metrics allow grouping by `customer_segment` and `country`. Checkout metrics also allow `device_type` and payment metrics also allow `payment_method`. For average order value by customer segment, join orders to customers by customer ID while preserving one row per order. Payment metrics follow payments → orders → customers to preserve one row per attempt. Joining payments into an order-grain calculation repeats orders with retries and can inflate GMV or distort average order value.
 
-The access policy checks the exact metric ID and requested dimensions against the registry for an authenticated role supplied by the caller. Role names are case-insensitive. Unknown roles and metrics are denied. Admin access is limited to approved aggregates and dimensions, with no raw record or arbitrary SQL capability.
+The access policy checks the exact metric ID and requested dimensions against the registry for the simulated role supplied by the CLI or Streamlit. Role names are case-insensitive. Unknown roles are denied and unrecognised metrics are unsupported. Admin access is limited to approved aggregates and dimensions, with no raw record or arbitrary SQL capability.
 
-Retrieval normalizes case and punctuation and matches whole phrases from metric IDs, names, definitions and synonyms. Longer matches rank first, with ties ordered by metric ID. The caller can set `top_k` and receives only definitions visible to its role. An unmatched question returns no candidates. A matching phrase in a broader question can surface a definition for consideration. Every candidate still requires explicit intent validation and authorization before any future execution.
+Retrieval normalises case and punctuation and matches whole phrases from metric IDs, names, definitions and synonyms. Longer phrases take precedence over shorter overlapping matches. The workflow uses explicit matches for preflight authorisation and sends only approved metric metadata to the model. A recognised phrase within a broader request still has to pass scope and plan validation before execution.
 
 ## Analytics CLI
 
@@ -87,7 +91,7 @@ Set `OPENAI_API_KEY` and `OPENAI_MODEL` in the process environment. Choose an av
 
 The `--role` flag simulates a trusted role for local demonstration. Production use requires authentication and server-side role assignment. Use `--db` to select a trusted synthetic SQLite fixture. The JSON response includes a status and a human-readable answer. Successful responses also include the metric definition, reporting dates and unit. Decimal values are serialized as strings to preserve precision. The end date is exclusive. A grouped query with no matching rows returns no groups, and an ungrouped ratio or average with a zero denominator returns null.
 
-LangGraph retrieves role-visible definitions, calls OpenAI for a strict query plan, validates the plan, builds approved parameterised SQL, executes it in read-only and query-only mode, and formats the aggregate result locally. Invalid plans and policy failures bypass SQL execution. Queries support one approved metric and at most one approved grouping. A grouped query is capped at 100 groups and fails safely if it exceeds that limit.
+LangGraph checks authorisation and question scope before calling OpenAI. Validated plans support one approved metric and at most one approved grouping. The workflow formats the result locally and caps grouped queries at 100 groups. Invalid plans, policy failures and requests needing clarification bypass SQL execution.
 
 For requests that pass preflight, the model receives the question, matching role-visible metric metadata, and the fixed reporting date of 30 June 2025. Database rows and query results stay local. Use synthetic questions without confidential information. Relative dates use the reporting date. For example, “last month” refers to May 2025. This local prototype relies on a trusted SQLite fixture and does not implement small-group suppression.
 
@@ -95,7 +99,7 @@ Run `.venv/bin/python -m pytest` for the offline suite. Agent tests inject model
 
 ## Security and audit logging
 
-The agent checks explicit metric mentions against the trusted role before calling OpenAI. A request that names any denied metric is denied even if it also names an allowed metric or claims a different role. A request that names multiple allowed metrics is unsupported. OpenAI returns a wire response that can represent unsupported or ambiguous intent without a query plan. Only an answerable response can become a query plan, and the agent rechecks its metric, role, grouping and dates. API failures, connection failures, incomplete responses and malformed output have distinct diagnostic codes. LangSmith tracing is disabled for agent requests.
+The agent checks recognised metric mentions against the trusted role before calling OpenAI. A recognised denied metric triggers denial even if the request also names an allowed metric or claims a different role. A request that names multiple allowed metrics is unsupported. OpenAI's structured response can represent unsupported or ambiguous intent without a query plan. Only an answerable response can become a query plan, and the agent rechecks its metric, role, grouping and dates. API failures, connection failures, incomplete responses and malformed output have distinct diagnostic codes. LangSmith tracing is disabled for agent requests.
 
 The execution gate recognizes separate metric, date and grouping clauses. For example, use “For May, could you report AOV by customer segment?” or “How many sign-ups were there in March?” Preflight rejects unrecognized measures and unsupported constraints, asks for clarification on missing or vague intent, and checks recognized groupings and reporting dates before interpretation. Filter values, comparisons, extra metrics, raw records and SQL cannot pass the clause check. The model's plan must match the metric, grouping and both date bounds found in the request. Plain-text range endpoints are inclusive and converted to a half-open query interval. Weeks start on Monday, and rolling day ranges include the reporting date. The parser can still reject valid paraphrases outside its recognized vocabulary and date forms.
 
@@ -129,7 +133,7 @@ The audit log confirmed distinct request IDs, authorisation decisions, execution
 
 ## Reproducible evaluation
 
-The version-controlled golden set in `evaluation/golden.json` has 40 synthetic cases covering all eight metrics and all four roles. It includes 12 standard, 6 grouped or cross-table, 6 unauthorized, 6 adversarial, 4 unsupported, 3 ambiguous, and 3 date or dimension edge cases. Five cases are marked `live_baseline` and 35 are new. Expectations follow the business and access rules, including for valid paraphrases the agent currently rejects.
+The version-controlled golden set in `evaluation/golden.json` has 40 synthetic cases covering all eight metrics and all four roles. It includes 12 standard, 6 grouped or cross-table, 6 unauthorized, 6 adversarial, 4 unsupported, 3 ambiguous, and 3 date or dimension edge cases. Five cases are marked `live_baseline` because they came from earlier manual runs. The remaining 35 were added for the golden set. Expected outcomes follow the business and access rules and were preserved through optimisation.
 
 ```sh
 .venv/bin/python -m evaluation.reference
@@ -247,6 +251,20 @@ In **Analytics Assistant**, select a demonstration role, load an example or type
 
 **Metric Governance** reads the eight approved definitions and role permissions from the registry and policy. **Evaluation Dashboard** reads the tracked Phase 6 baseline and Phase 7 post-optimisation report. It displays the supplemental set separately and records the offline test context from `evaluation/UI_VERIFICATION.json`. Loading the app makes no OpenAI calls and runs no evaluation.
 
-This is a local synthetic demonstration with simulated roles, a trusted generated fixture, and local audit files. Browser sessions hold only their latest response, and the app has no shared query-result cache. The parser can reject valid wording, model calls depend on API availability, and the benchmark provides no evidence of production safety or generalisation to an independent holdout.
+This is a local synthetic demonstration with simulated roles, a trusted generated fixture, and local audit files. Browser sessions hold only their latest response, and the app has no shared query-result cache.
 
-The Phase 8 verification ran the full suite with OpenAI configuration unset. Streamlit's local health endpoint and app route both returned HTTP 200 in a headless startup smoke test. The suite exercised the rendered app with Streamlit AppTest and an injected interpreter for grouped SQL results.
+### Verification evidence
+
+- **Offline automated verification.** The final review reran all 133 pytest tests with OpenAI configuration unset. Streamlit AppTest exercises rendered states and uses an injected interpreter for grouped SQL results. The Phase 8 headless smoke test returned HTTP 200 from the local health endpoint and app route.
+- **Live model evaluation.** The recorded Phase 6 and Phase 7 runs used `gpt-4.1-mini`. Their case results, diagnostics and latency are preserved in the curated evaluation reports. The final review checked these reports against the recorded runs.
+- **Manual UI verification.** The project owner reported manually verifying all four scenarios in Streamlit: an authorised query, an unauthorised query, a prompt-injection attempt and an unsupported metric request. This was a separate interactive check.
+
+## Production readiness
+
+The prototype is designed for localhost and generated data. Use synthetic questions because requests that pass preflight send the question and role-visible metric definitions to OpenAI. A deployment for regulated data would require server-side identity and entitlement integration, managed secrets and service access, provider data-handling and retention review, aggregate disclosure controls for small groups, and tamper-evident audit storage with retention and monitoring. Operational readiness also needs resource limits, deployment hardening and security testing.
+
+The fixed parser vocabulary can reject legitimate wording, and accepted requests depend on API availability and model agreement. The golden cases guided optimisation and the supplemental set was created during development. The limited sample and shared fixture leave generalisation and robustness beyond these cases unmeasured. Reported benchmark scores and zero observed unsafe execution apply to the tested requests.
+
+## Development with Codex
+
+Codex was used throughout development to implement the synthetic fixture, metric registry, governed workflow, safeguards, evaluation harness and Streamlit interface, and to run offline tests and document results. The project owner provided the business requirements and acceptance criteria, approved the work in phases, ran the recorded live evaluations and manually verified the UI scenarios. Phase 7 used the recorded failures to guide changes while preserving the original golden cases and expected outcomes for comparison.

@@ -232,3 +232,20 @@ def test_full_offline_eval_reports_failures_without_changing_expectations(datase
     assert rates["numerical_accuracy"]["denominator"] == 19
     for case in report["cases"]:
         assert case["expected"] == _case(dataset, case["case_id"]).expected.model_dump(mode="json")
+
+
+def test_supplemental_cases_keep_separate_provenance_and_reproducible_results(tmp_path, dataset):
+    from evaluation.dataset import DATASETS
+
+    supplemental = load_dataset(DATASETS["supplemental"])
+    assert supplemental.version != dataset.version
+    assert len(supplemental.cases) == 15
+    assert {case.origin for case in supplemental.cases} == {"supplemental"}
+    assert {case.case_id for case in supplemental.cases}.isdisjoint(case.case_id for case in dataset.cases)
+    assert {case.question for case in supplemental.cases}.isdisjoint(case.question for case in dataset.cases)
+    fixture_path = tmp_path / "fixture.sqlite3"
+    generate_database(fixture_path, supplemental.seed)
+    reference = ReferenceData(fixture_path)
+    for case in supplemental.cases:
+        if case.expected.sql_permitted:
+            assert reference.calculate(case.expected) == case.expected.results

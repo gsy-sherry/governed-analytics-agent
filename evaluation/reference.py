@@ -9,7 +9,7 @@ from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from evaluation.dataset import DATASET_PATH, ExpectedOutcome, ExpectedResult, load_dataset
+from evaluation.dataset import DATASETS, ExpectedOutcome, ExpectedResult, load_dataset
 from governed_analytics.synthetic_data import REPORTING_DATE, generate_database
 
 
@@ -83,9 +83,11 @@ def _render(value):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", choices=tuple(DATASETS), default="golden")
     parser.add_argument("--write", action="store_true", help="Update only the stored numerical results")
     args = parser.parse_args()
-    dataset = load_dataset()
+    dataset_path = DATASETS[args.dataset]
+    dataset = load_dataset(dataset_path)
     if dataset.reporting_date != REPORTING_DATE:
         parser.error("Dataset and fixture reporting dates differ")
     changed = []
@@ -100,7 +102,7 @@ def main() -> int:
                     changed.append(case.case_id)
                     case.expected.results = results
     if args.write:
-        DATASET_PATH.write_text(dataset.model_dump_json(indent=2, exclude_unset=True) + "\n")
+        dataset_path.write_text(dataset.model_dump_json(indent=2, exclude_unset=True) + "\n")
     if changed:
         print(f"{'Updated' if args.write else 'Reference mismatch'}: {', '.join(changed)}")
     else:

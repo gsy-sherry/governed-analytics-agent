@@ -2,16 +2,15 @@
 
 import json
 import os
-from datetime import date, timedelta
+from datetime import date
 from typing import Literal, Protocol
 
 from openai import OpenAI
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from governed_analytics.metric_registry import METRIC_REGISTRY, MetricDefinition
+from governed_analytics.question_scope import REPORTING_END
 from governed_analytics.synthetic_data import HISTORY_START, REPORTING_DATE
-
-REPORTING_END = REPORTING_DATE + timedelta(days=1)
 
 
 class IntentOutput(BaseModel):
@@ -19,11 +18,13 @@ class IntentOutput(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    intent_status: Literal["answerable", "unsupported", "clarification_required"]
-    metric_id: str | None = None
-    dimension: str | None = None
-    start_date: str | None = None
-    end_date: str | None = None
+    intent_status: Literal["answerable", "unsupported", "clarification_required"] = Field(
+        description="Use unsupported for a specific out-of-catalog measure or unsupported operation. Use clarification_required for an unspecified measure or unresolved period."
+    )
+    metric_id: str | None = Field(default=None, description="Exact candidate metric ID for answerable intent.")
+    dimension: str | None = Field(default=None, description="Explicit grouping as an approved dimension ID, or null for a total.")
+    start_date: str | None = Field(default=None, description="First included calendar date, YYYY-MM-DD.")
+    end_date: str | None = Field(default=None, description="First excluded calendar date, YYYY-MM-DD.")
 
 
 class IntentConfigurationError(ValueError):
@@ -68,11 +69,16 @@ candidate definitions. Choose exactly one metric only if its meaning matches the
 entire analytical request. Never substitute a different metric. If the question
 requests raw data, SQL, an unapproved metric, grouping, filter or operation, return
 unsupported. This includes comparisons, value filters and multiple metrics, even
-if part of the request is supported. Unclear metric choice or missing or ambiguous
-dates require clarification. For non-answerable intent use null fields.
+if part of the request is supported. A specifically named measure missing from
+the candidates is unsupported; an unspecified measure or unresolved date needs
+clarification. Never assume a period or omit a grouping to make a plan fit.
+For non-answerable intent use null fields.
 Resolve relative dates using {REPORTING_DATE}, never the current system date.
 Use ISO dates, with start inclusive and end exclusive. Last month means the
-previous calendar month. The full synthetic period is [{HISTORY_START}, {REPORTING_END}).
+previous calendar month. Calendar weeks start on Monday. A named day is included,
+as are both ends of an expressed date range. Last N days includes the reporting
+date. Dates without a year use the reporting year unless an endpoint supplies
+the shared year. The full synthetic period is [{HISTORY_START}, {REPORTING_END}).
 Populate dimension only for an explicitly requested, approved grouping.
 """.strip()
 

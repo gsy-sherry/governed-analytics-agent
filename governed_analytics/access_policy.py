@@ -2,7 +2,7 @@
 
 from governed_analytics.metric_registry import METRIC_REGISTRY
 
-POLICY_VERSION = "2"
+POLICY_VERSION = "3"
 ROLES = {role.casefold(): role for metric in METRIC_REGISTRY.values() for role in metric.allowed_roles}
 
 

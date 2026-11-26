@@ -29,7 +29,7 @@ from governed_analytics.intent import (
 )
 from governed_analytics.knowledge_retrieval import match_metrics
 from governed_analytics.metric_registry import METRIC_REGISTRY, MetricDefinition
-from governed_analytics.question_scope import supports_question
+from governed_analytics.question_scope import QuestionScope, inspect_question
 from governed_analytics.synthetic_data import HISTORY_START
 
 
@@ -67,6 +67,7 @@ class _TrustedContext:
 class _State(TypedDict):
     question: str
     candidates: NotRequired[tuple[MetricDefinition, ...]]
+    scope: NotRequired[QuestionScope]
     raw_plan: NotRequired[str]
     plan: NotRequired[QueryPlan]
     query: NotRequired[_ApprovedQuery]
@@ -76,6 +77,14 @@ class _State(TypedDict):
 
 def _stop(status: str, diagnostic: str, message: str) -> dict[str, AnalyticsResponse]:
     return {"response": AnalyticsResponse(status, message, diagnostic)}
+
+
+def _clarify() -> dict[str, AnalyticsResponse]:
+    return _stop("clarification_required", "ambiguous_intent", "Please specify one metric and a reporting period.")
+
+
+def _reject_dimension() -> dict[str, AnalyticsResponse]:
+    return _stop("rejected", "invalid_dimension", "That grouping is unavailable for the requested metric.")
 
 
 def _retrieve(state: _State, runtime: Runtime[_TrustedContext]) -> dict:
@@ -94,9 +103,25 @@ def _retrieve(state: _State, runtime: Runtime[_TrustedContext]) -> dict:
         return _stop("denied", "unknown_role", "The trusted role is unavailable.")
     if len(matches) > 1:
         return _stop("unsupported", "multiple_metrics", "Request one approved metric at a time.")
-    if matches:
-        context.metric_id = matches[0].metric_id
-    return {"candidates": matches}
+    metric = matches[0] if matches else None
+    if metric:
+        context.metric_id = metric.metric_id
+    scope = inspect_question(question, metric)
+    if scope.issue == "invalid_dimension" or (
+        scope.dimension is not None and metric is not None
+        and not can_access_metric(context.role, metric.metric_id, dimensions=(scope.dimension,))
+    ):
+        context.authorization = "denied"
+        return _reject_dimension()
+    if scope.issue == "ambiguous_intent":
+        return _clarify()
+    if scope.issue == "invalid_period":
+        return _stop("rejected", "invalid_period", "Choose a non-empty period within January through June 2025.")
+    if scope.issue == "unmatched_metric":
+        return _stop("unsupported", "unmatched_metric", "The requested metric is outside the approved catalog.")
+    if scope.issue:
+        return _stop("unsupported", "unsupported_question_shape", "Specify one approved metric, a period and optionally one grouping.")
+    return {"candidates": matches, "scope": scope}
 
 
 def _validate(state: _State, runtime: Runtime[_TrustedContext]) -> dict:
@@ -114,7 +139,7 @@ def _validate(state: _State, runtime: Runtime[_TrustedContext]) -> dict:
     if intent.intent_status == "unsupported":
         return _stop("unsupported", "unsupported_intent", "This request is outside the approved analytics scope.")
     if intent.intent_status == "clarification_required":
-        return _stop("clarification_required", "ambiguous_intent", "Please specify one metric and a reporting period.")
+        return _clarify()
 
     context = runtime.context
     metric = METRIC_REGISTRY.get(plan.metric_id)
@@ -128,13 +153,16 @@ def _validate(state: _State, runtime: Runtime[_TrustedContext]) -> dict:
         context.role, metric.metric_id, dimensions=(plan.dimension,),
     ):
         context.authorization = "denied"
-        return _stop("rejected", "invalid_dimension", "That grouping is unavailable for the requested metric.")
+        return _reject_dimension()
     if not HISTORY_START <= plan.start_date < plan.end_date <= REPORTING_END:
         return _stop("rejected", "invalid_period", "Choose a non-empty period within January through June 2025.")
     if metric not in state["candidates"]:
         return _stop("unsupported", "unmatched_metric", "The requested metric could not be matched to an approved definition.")
-    if not supports_question(state["question"], metric, plan.dimension):
-        return _stop("unsupported", "unsupported_question_shape", "Specify one approved metric, a period and optionally one grouping.")
+    scope = state["scope"]
+    if plan.dimension != scope.dimension:
+        return _stop("rejected", "dimension_mismatch", "The interpreted grouping did not match the request.")
+    if (plan.start_date, plan.end_date) != (scope.start, scope.end):
+        return _stop("rejected", "period_mismatch", "The interpreted period did not match the request.")
     context.plan = plan
     context.authorization = "allowed"
     return {"plan": plan}

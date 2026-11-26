@@ -89,7 +89,7 @@ The `--role` flag simulates a trusted role for local demonstration. Production u
 
 LangGraph retrieves role-visible definitions, calls OpenAI for a strict query plan, validates the plan, builds approved parameterised SQL, executes it in read-only and query-only mode, and formats the aggregate result locally. Invalid plans and policy failures bypass SQL execution. Queries support one approved metric and at most one approved grouping. A grouped query is capped at 100 groups and fails safely if it exceeds that limit.
 
-The model receives the question, matching role-visible metric metadata, and the fixed reporting date of 30 June 2025. Database rows and query results stay local. Use synthetic questions without confidential information. Relative dates use the reporting date. For example, “last month” refers to May 2025. Lexical retrieval requires a recognizable metric phrase, and intent interpretation can still misunderstand a question. Deterministic checks constrain execution to approved aggregates but do not guarantee semantic accuracy. This local prototype relies on a trusted SQLite fixture and does not implement small-group suppression.
+For requests that pass preflight, the model receives the question, matching role-visible metric metadata, and the fixed reporting date of 30 June 2025. Database rows and query results stay local. Use synthetic questions without confidential information. Relative dates use the reporting date. For example, “last month” refers to May 2025. This local prototype relies on a trusted SQLite fixture and does not implement small-group suppression.
 
 Run `.venv/bin/python -m pytest` for the offline suite. Agent tests inject model responses and require no API key.
 
@@ -97,7 +97,7 @@ Run `.venv/bin/python -m pytest` for the offline suite. Agent tests inject model
 
 The agent checks explicit metric mentions against the trusted role before calling OpenAI. A request that names any denied metric is denied even if it also names an allowed metric or claims a different role. A request that names multiple allowed metrics is unsupported. OpenAI returns a wire response that can represent unsupported or ambiguous intent without a query plan. Only an answerable response can become a query plan, and the agent rechecks its metric, role, grouping and dates. API failures, connection failures, incomplete responses and malformed output have distinct diagnostic codes. LangSmith tracing is disabled for agent requests.
 
-The execution gate accepts a single recognized metric, an explicit period and optionally one grouping. For example, use “GMV in June 2025”, “payment attempts last month”, or “AOV by customer segment in June 2025”. Requests with filter values, comparisons, extra metrics, raw records or SQL are outside this format. The agent checks that the grouping in the plan matches the grouping in the question. The conservative format can reject valid paraphrases. The model still interprets dates, and a bounded, valid date range can differ from what the user intended. Role selection remains a demonstration setting, and the prototype has no small-group suppression.
+The execution gate recognizes separate metric, date and grouping clauses. For example, use “For May, could you report AOV by customer segment?” or “How many sign-ups were there in March?” Preflight rejects unrecognized measures and unsupported constraints, asks for clarification on missing or vague intent, and checks recognized groupings and reporting dates before interpretation. Filter values, comparisons, extra metrics, raw records and SQL cannot pass the clause check. The model's plan must match the metric, grouping and both date bounds found in the request. Plain-text range endpoints are inclusive and converted to a half-open query interval. Weeks start on Monday, and rolling day ranges include the reporting date. The parser can still reject valid paraphrases outside its recognized vocabulary and date forms.
 
 Each request handled by the agent appends one terminal JSON Lines event to `logs/audit.jsonl`. The response and event share a request ID. The event includes a UTC timestamp, trusted role, recognized metric ID, validated grouping and period where available, authorization decision, response status, safe diagnostic code, SQL attempt and success flags, elapsed milliseconds before the audit write, returned aggregate row count, and policy version. A denied request may have no period because the agent can deny it before interpretation. Audit events contain no raw questions, API credentials, raw model output, SQL text, group labels, or aggregate values.
 
@@ -167,3 +167,56 @@ The five failures were legitimate requests. `STD-09` had no recognized metric ph
 ### Phase 6 live baseline
 
 The full live run with `gpt-4.1-mini` produced 28/40 correct statuses, 14/19 correct intents, 14/19 correct numerical answers and 22/28 correct authorisation decisions. All 21 cases that prohibit SQL had verified evidence of no attempt. The [curated baseline report](evaluation/BASELINE.md) records both runs separately, including category scores, latency and case-level diagnostics. These results describe a limited synthetic benchmark with simulated roles and a fixed fixture.
+
+### Phase 7 evaluation-driven optimisation
+
+| Baseline cases | Root cause |
+| --- | --- |
+| `STD-01`, `STD-11`, `STD-12`, `GRP-05` | The deterministic full-sentence pattern rejected question bridges, polite lead-ins and a relative date before the metric. |
+| `STD-09` | Retrieval did not recognize “customers signed up”. The model received no matching candidate and asked for clarification. |
+| `UNS-01`–`UNS-04` | The system let the model decide the outcome for a named measure with no catalog match. The model returned clarification for all four. |
+| `AMB-01`, `AMB-03` | A model plan reached a deterministic gate that treated missing or vague dates as an unsupported sentence shape. |
+| `EDG-03` | The model returned unsupported before the workflow evaluated the requested dimension and recorded an authorisation decision. |
+
+Policy 3 checks explicit authorisation and question scope before interpretation. A named unsupported measure, a generic metric reference, a missing period and an invalid constraint take distinct paths. Broader synonym coverage and flexible clause placement accept more valid requests, while unconsumed text blocks execution. OpenAI must return the same metric, grouping and date bounds that preflight found in the question before the read-only, parameterised aggregate path can execute. A legitimate request can still be rejected if the parser does not recognise the wording or the model returns a different interpretation.
+
+The original golden set and Phase 6 baseline are preserved. The 15 supplemental validation cases in `evaluation/supplemental.json` were written during optimisation and are not an independent holdout.
+
+| Offline dataset | Status | Intent | Numerical | Authorisation | False rejections | Unsafe SQL | Verified blocking |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Golden 1.0.0 | 40/40 | 19/19 | 19/19 | 28/28 | 0/19 | 0/21 | 21/21 |
+| Supplemental 1.0.0 | 15/15 | 6/6 | 6/6 | 8/8 | 0/6 | 0/9 | 9/9 |
+
+Both offline runs used injected intent responses.
+
+#### Live comparison on the original 40 cases
+
+Both live runs used `gpt-4.1-mini` and golden dataset 1.0.0. The policy changed from version 2 to version 3.
+
+| Measure | Phase 6 baseline | Phase 7 |
+| --- | ---: | ---: |
+| Exact status accuracy | 28/40 (70.0%) | 40/40 (100%) |
+| Intent accuracy | 14/19 (73.7%) | 19/19 (100%) |
+| Numerical accuracy | 14/19 (73.7%) | 19/19 (100%) |
+| Authorisation accuracy | 22/28 (78.6%) | 28/28 (100%) |
+| Unsafe SQL attempts | 0/21 | 0/21 |
+| False rejections | 5/19 (26.3%) | 0/19 |
+| Verified blocking recall | 21/21 | 21/21 |
+| API or system errors | 0/40 | 0/40 |
+| P50 latency | 978.372 ms | 1.966 ms |
+| P95 latency | 1485.657 ms | 1767.590 ms |
+
+Early deterministic outcomes avoid API calls for blocked requests, including unsupported measures and requests needing clarification. Median latency on the 21 cases that prohibit SQL fell from 910.381 ms to 0.667 ms. That fast path accounts for the low overall median. Requests that proceed to OpenAI still incur network and model latency. The overall P95 increased in this run, and the median for the 19 legitimate cases moved from 1020.927 ms to 1287.872 ms. These single runs measure observed latency and cannot isolate service variability.
+
+#### Supplemental live validation
+
+The separate 15-case live run achieved 15/15 correct statuses, 6/6 correct intents and numerical answers, and 8/8 correct authorisation decisions. It recorded 0/9 unsafe SQL attempts, 9/9 verified blocks, 0/6 false rejections and 0/15 API or system errors. P50 was 2.097 ms and P95 was 1445.635 ms. The [post-optimisation report](evaluation/POST_OPTIMISATION.md) preserves both live runs and their category-level scores.
+
+The original set guided development, and the supplemental set was created during optimisation. Both sets use a small, fixed synthetic fixture with simulated roles. This introduces development benchmark bias and leaves no independent holdout for measuring generalisation. Zero unsafe SQL attempts describes these tested requests. It provides no production safety guarantee.
+
+```sh
+.venv/bin/python -m pytest
+.venv/bin/python -m evaluation --mode offline --dataset golden
+.venv/bin/python -m evaluation --mode offline --dataset supplemental
+OPENAI_MODEL=gpt-4.1-mini .venv/bin/python -m evaluation --mode live --dataset golden
+```

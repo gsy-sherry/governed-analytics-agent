@@ -9,7 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
 from time import perf_counter
 
-from evaluation.dataset import Case, Dataset, load_dataset
+from evaluation.dataset import DATASETS, Case, Dataset, load_dataset
 from evaluation.scoring import load_audit_events, score_case, summarize
 from governed_analytics.access_policy import POLICY_VERSION
 from governed_analytics.agent import AnalyticsAgent
@@ -102,12 +102,13 @@ def _summary(report: dict) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("offline", "live"), default="offline", help="Explicitly select live to call OpenAI")
+    parser.add_argument("--dataset", choices=tuple(DATASETS), default="golden")
     parser.add_argument("--case", action="append", help="Select a case ID (repeatable)")
     parser.add_argument("--category", action="append", help="Select a category (repeatable)")
     parser.add_argument("--output-dir", type=Path, default=Path("reports/evaluation"))
     args = parser.parse_args()
 
-    dataset = load_dataset()
+    dataset = load_dataset(DATASETS[args.dataset])
     if set(args.case or ()) - {case.case_id for case in dataset.cases}:
         parser.error("Unknown case ID")
     if set(args.category or ()) - {case.category for case in dataset.cases}:

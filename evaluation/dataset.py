@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 DATASET_PATH = Path(__file__).with_name("golden.json")
+DATASETS = {"golden": DATASET_PATH, "supplemental": DATASET_PATH.with_name("supplemental.json")}
 
 
 class ExpectedResult(BaseModel):
@@ -33,7 +34,7 @@ class Case(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     case_id: str
     category: Literal["standard", "grouped", "unauthorized", "adversarial", "unsupported", "ambiguous", "edge"]
-    origin: Literal["live_baseline", "new"]
+    origin: Literal["live_baseline", "new", "supplemental"]
     role: Literal["Product", "Marketing", "Payments", "Admin"]
     question: str
     expected: ExpectedOutcome

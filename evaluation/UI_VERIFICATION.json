@@ -1,0 +1,10 @@
+{
+  "suite": "Phase 8 full repository suite",
+  "mode": "Offline synthetic fixtures and Streamlit AppTest",
+  "command": "env -u OPENAI_API_KEY -u OPENAI_MODEL .venv/bin/python -m pytest",
+  "python": "3.14.6",
+  "pytest": "9.2.0",
+  "streamlit": "1.67.0",
+  "passed": 133,
+  "warnings": 17
+}
